@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# 全局 ARG：仅对 FROM 行生效，无默认值，CI 必须传入
-ARG CADDY_VERSION
+# 全局 ARG：仅对 FROM 行生效，任意占位版本均可，CI 会覆盖
+ARG CADDY_VERSION=2.11.7
 
 # ---------- 构建阶段 ----------
 FROM caddy:${CADDY_VERSION}-builder-alpine AS builder
