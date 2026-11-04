@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# 全局 ARG：仅对 FROM 行生效，任意占位版本均可，CI 会覆盖
+# 全局 ARG：仅对 FROM 行生效，任意占位版本均可
+# CI 中会通过 build-args 覆盖为 Docker Hub 上实际解析到的版本
 ARG CADDY_VERSION=2.11.7
 
 # ---------- 构建阶段 ----------
@@ -15,6 +16,9 @@ RUN xcaddy build v${CADDY_VERSION} ${CADDY_PLUGINS}
 
 # ---------- 运行阶段 ----------
 FROM caddy:${CADDY_VERSION}-alpine
+
+# 强制升级 Alpine 系统包，拉取当前仓库中的安全修复
+RUN apk upgrade --no-cache
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 
