@@ -4,7 +4,7 @@
 
 ## 📁 文件结构
 
-```
+```text
 .
 ├── Dockerfile
 └── .github/
@@ -33,7 +33,9 @@ PLUGINS="$PLUGINS --with github.com/greenpau/caddy-security"
 # 按需增删，每行一个 --with
 ```
 
-插件模块路径可参考项目内的插件清单文档。删除不需要的行、添加新行即可，无需改动 `Dockerfile`。
+删除不需要的行、添加新行即可，无需改动 `Dockerfile`。
+
+插件模块路径可参考项目内的[插件清单文档](./plugins.md)。
 
 ### 3. 确认镜像名称
 
