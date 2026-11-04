@@ -8,7 +8,6 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/caddy-pass
-  SOURCE_REPO: caddyserver/caddy
 
 jobs:
   resolve-and-build:
@@ -21,54 +20,67 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------- 解析最新稳定版 tag ----------
-      - name: Resolve latest Caddy release
+      # ---------- 解析 Docker Hub 上最新的稳定版 Caddy ----------
+      - name: Resolve latest Caddy version from Docker Hub
         id: caddy_version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          LATEST_TAG=$(gh release view --repo ${{ env.SOURCE_REPO }} --json tagName -q '.tagName')
-          if [ -z "$LATEST_TAG" ]; then
-            echo "::error::Failed to resolve latest Caddy release"
+          API_URL="https://hub.docker.com/v2/namespaces/library/repositories/caddy/tags?page_size=100&ordering=last_updated"
+          RESPONSE=$(curl -fsS "$API_URL")
+
+          # 仅保留形如 X.Y.Z-builder-alpine 的标签，排除浮动标签和预发布版本
+          TAGS=$(echo "$RESPONSE" | jq -r '.results[].name' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-builder-alpine$' || true)
+
+          if [ -z "$TAGS" ]; then
+            echo "::error::Docker Hub 上未找到任何版本化的 builder-alpine 标签"
             exit 1
           fi
-          # 剥离 v 前缀：v2.11.8 -> 2.11.8
-          VERSION="${LATEST_TAG#v}"
+
+          # 按语义版本排序，取最新一个
+          LATEST_TAG=$(echo "$TAGS" | sort -V | tail -n 1)
+          VERSION="${LATEST_TAG%-builder-alpine}"
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Resolved latest Caddy version: ${VERSION}"
+          echo "Resolved latest Caddy version from Docker Hub: ${VERSION} (tag: ${LATEST_TAG})"
 
-      # ---------- 检查该版本是否已存在，避免重复构建 ----------
-      - name: Check if image already exists
-        id: check_tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.caddy_version.outputs.version }}
-        run: |
-          EXISTS=$(gh api \
-            "/users/${{ github.repository_owner }}/packages/container/caddy-custom/versions" \
-            --jq '.[].metadata.container.tags[]' 2>/dev/null \
-            | grep -qx "${VERSION}" && echo "true" || echo "false")
-          echo "exists=${EXISTS}" >> "$GITHUB_OUTPUT"
-
-      # 以下步骤仅在版本不存在时执行
-      # ---------- 准备 Buildx（GHA 缓存后端必需） ----------
-      - name: Set up Docker Buildx
-        if: steps.check_tag.outputs.exists == 'false'
-        uses: docker/setup-buildx-action@v3
-
+      # ---------- 登录 GHCR（提前，供 manifest 检查和后续推送） ----------
       - name: Log in to GHCR
-        if: steps.check_tag.outputs.exists == 'false'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ---------- 检查标签是否已存在（手动触发强制构建） ----------
+      - name: Check if image tag already exists
+        id: check_tag
+        env:
+          VERSION: ${{ steps.caddy_version.outputs.version }}
+        run: |
+          # 手动触发时强制构建，以便应用插件变更
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Manual trigger: forcing build."
+            exit 0
+          fi
+
+          IMAGE="${{ env.IMAGE_NAME }}:${VERSION}"
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $IMAGE already exists, skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $IMAGE not found, build will proceed."
+          fi
+
+      # ---------- 准备 Buildx（GHA 缓存后端必需） ----------
+      - name: Set up Docker Buildx
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
       # ---------- 集中管理插件列表 ----------
-      # 按需增删；每行一个 --with
       - name: Define Caddy plugins
         if: steps.check_tag.outputs.exists == 'false'
-        id: plugins
         run: |
           PLUGINS=""
           PLUGINS="$PLUGINS --with github.com/caddy-dns/cloudflare"
@@ -76,9 +88,10 @@ jobs:
           PLUGINS="$PLUGINS --with github.com/greenpau/caddy-security"
           PLUGINS="$PLUGINS --with github.com/WeidiDeng/caddy-cloudflare-ip"
           PLUGINS="$PLUGINS --with github.com/mholt/caddy-dynamicdns"
+          # 按需继续添加或删减...
           echo "CADDY_PLUGINS=$PLUGINS" >> "$GITHUB_ENV"
 
-      # ---------- 构建到本地（不推送），用于测试 ----------
+      # ---------- 构建到本地（同时打测试标签和最终标签），用于测试 ----------
       - name: Build image for testing
         if: steps.check_tag.outputs.exists == 'false'
         uses: docker/build-push-action@v6
@@ -87,14 +100,17 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           load: true
-          tags: caddy-custom:test
+          tags: |
+            caddy-pass:test
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ steps.caddy_version.outputs.version }}
           build-args: |
             CADDY_VERSION=${{ steps.caddy_version.outputs.version }}
             CADDY_PLUGINS=${{ env.CADDY_PLUGINS }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ---------- 冒烟测试：用最小 Caddyfile 启动并验证 HTTP ----------
+      # ---------- 冒烟测试：轮询重试，验证 HTTP 响应 ----------
       - name: Smoke test
         if: steps.check_tag.outputs.exists == 'false'
         run: |
@@ -103,11 +119,28 @@ jobs:
             respond "ok" 200
           }
           EOF
+
           docker run -d --name smoke -p 8080:80 \
             -v /tmp/Caddyfile:/etc/caddy/Caddyfile:ro \
-            caddy-custom:test
-          sleep 3
-          curl -fsS http://localhost:8080/ || { docker logs smoke; docker rm -f smoke; exit 1; }
+            caddy-pass:test
+
+          SUCCESS=0
+          for i in $(seq 1 10); do
+            if curl -fsS http://localhost:8080/ > /dev/null 2>&1; then
+              SUCCESS=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "Smoke test failed. Container logs:"
+            docker logs smoke
+            docker rm -f smoke
+            exit 1
+          fi
+
+          echo "Smoke test passed."
           docker rm -f smoke
 
       # ---------- Trivy 扫描：CRITICAL 级别阻断推送 ----------
@@ -115,25 +148,14 @@ jobs:
         if: steps.check_tag.outputs.exists == 'false'
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: 'caddy-custom:test'
+          image-ref: 'caddy-pass:test'
           exit-code: '1'
           severity: 'CRITICAL'
           ignore-unfixed: true
 
-      # ---------- 测试和扫描均通过，正式推送 ----------
-      - name: Push final image
+      # ---------- 测试和扫描均通过，直接推送已测试的镜像 ----------
+      - name: Push tested image
         if: steps.check_tag.outputs.exists == 'false'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ steps.caddy_version.outputs.version }}
-          build-args: |
-            CADDY_VERSION=${{ steps.caddy_version.outputs.version }}
-            CADDY_PLUGINS=${{ env.CADDY_PLUGINS }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.IMAGE_NAME }}:${{ steps.caddy_version.outputs.version }}
