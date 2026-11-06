@@ -2,8 +2,8 @@ name: Build Caddy with Latest Stable Version
 
 on:
   schedule:
-    # 每天检查一次是否有新版本；有新版本才构建，无新版本则跳过
-    - cron: '0 6 * * *'
+    # 定时检查一次是否有新版本；有新版本才构建，无新版本则跳过
+    - cron: '30 22 5 * *'
   workflow_dispatch:
 
 env:
@@ -166,5 +166,4 @@ jobs:
       - name: Show image size
         if: steps.check_tag.outputs.exists == 'false'
         run: |
-          echo "=== 镜像大小 ==="
           docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" | grep caddy-pass
